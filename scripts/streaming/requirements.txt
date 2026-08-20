@@ -1,2 +1,0 @@
-websockets==13.1
-kafka-python==3.0.11

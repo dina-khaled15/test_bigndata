@@ -8,6 +8,7 @@ services:
       - "9000:9000"
     volumes:
       - namenode_data:/hadoop/dfs/name
+      - maritime-ais-download:/data
     environment:
       - CLUSTER_NAME=maritime
     env_file:
@@ -84,7 +85,7 @@ services:
   kafka:
     image: apache/kafka:3.9.0
     container_name: maritime-kafka
-    restart: "no"
+    restart: unless-stopped
 
     ports:
       - "9092:9092"
@@ -107,7 +108,49 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
 
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+    networks:
+      - default
+
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: maritime-kafka-ui
+    restart: unless-stopped
+
+    ports:
+      - "8083:8080"
+
+    environment:
+      KAFKA_CLUSTERS_0_NAME: maritime-kafka
+
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+
+    depends_on:
+      - kafka
+
+    networks:
+      - default
+
+
+
+  ais-producer:
+    build:
+      context: ./streaming
+    container_name: maritime-ais-producer
+
+    depends_on:
+      - kafka
+
+    environment:
+      - AISSTREAM_API_KEY=${AISSTREAM_API_KEY}
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
 
     networks:
       - maritime-network
@@ -219,6 +262,9 @@ volumes:
   namenode_data:
   datanode_data:
   postgres_data:
+  kafka-data:
+  maritime-ais-download:
+    external: true
 
 networks:
   maritime-network:
