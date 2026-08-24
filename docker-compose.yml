@@ -1,38 +1,61 @@
 services:
+
+  # =========================================================
+  # HDFS - NameNode
+  # =========================================================
   namenode:
     image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
     container_name: maritime-namenode
     restart: "no"
+
     ports:
       - "9870:9870"
       - "9000:9000"
+
     volumes:
       - namenode_data:/hadoop/dfs/name
       - maritime-ais-download:/data
+
     environment:
       - CLUSTER_NAME=maritime
+
     env_file:
       - ./.env
+
     networks:
       - maritime-network
 
+
+  # =========================================================
+  # HDFS - DataNode
+  # =========================================================
   datanode:
     image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
     container_name: maritime-datanode
     restart: "no"
+
     depends_on:
       - namenode
+
     ports:
       - "9864:9864"
+
     volumes:
       - datanode_data:/hadoop/dfs/data
+
     environment:
       - SERVICE_PRECONDITION=namenode:9870
+
     env_file:
       - ./.env
+
     networks:
       - maritime-network
 
+
+  # =========================================================
+  # SPARK MASTER
+  # =========================================================
   spark-master:
     image: apache/spark:3.5.6
     container_name: maritime-spark-master
@@ -52,14 +75,17 @@ services:
       - "7077:7077"
       - "8080:8080"
 
-    networks:
-      - maritime-network
-
     volumes:
       - ./spark:/opt/spark-apps
       - ./scripts:/opt/scripts
 
+    networks:
+      - maritime-network
 
+
+  # =========================================================
+  # SPARK WORKER
+  # =========================================================
   spark-worker:
     image: apache/spark:3.5.6
     container_name: maritime-spark-worker
@@ -82,6 +108,10 @@ services:
     networks:
       - maritime-network
 
+
+  # =========================================================
+  # KAFKA
+  # =========================================================
   kafka:
     image: apache/kafka:3.9.0
     container_name: maritime-kafka
@@ -112,13 +142,15 @@ services:
       KAFKA_MIN_INSYNC_REPLICAS: 1
 
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
 
     networks:
-      - default
+      - maritime-network
 
 
+  # =========================================================
+  # KAFKA UI
+  # =========================================================
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: maritime-kafka-ui
@@ -129,20 +161,22 @@ services:
 
     environment:
       KAFKA_CLUSTERS_0_NAME: maritime-kafka
-
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
 
     depends_on:
       - kafka
 
     networks:
-      - default
+      - maritime-network
 
 
-
+  # =========================================================
+  # AIS STREAM PRODUCER
+  # =========================================================
   ais-producer:
     build:
       context: ./streaming
+
     container_name: maritime-ais-producer
 
     depends_on:
@@ -155,6 +189,10 @@ services:
     networks:
       - maritime-network
 
+
+  # =========================================================
+  # POSTGRES - AIRFLOW METADATA DATABASE
+  # =========================================================
   postgres:
     image: postgres:16
     container_name: maritime-postgres
@@ -171,8 +209,15 @@ services:
     networks:
       - maritime-network
 
+
+  # =========================================================
+  # AIRFLOW INIT
+  # =========================================================
   airflow-init:
-    image: apache/airflow:2.10.5
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+
     container_name: maritime-airflow-init
     restart: "no"
 
@@ -189,23 +234,33 @@ services:
       - ./airflow/logs:/opt/airflow/logs
       - ./airflow/plugins:/opt/airflow/plugins
 
+      # Spark jobs available to Airflow
+      - ./spark:/opt/spark-apps
+
+      # Allow Airflow to communicate with Docker
+      - /var/run/docker.sock:/var/run/docker.sock
+
     command:
       - bash
       - -c
       - |
         airflow db migrate
+
         airflow users create \
           --username admin \
           --password admin \
           --firstname Maritime \
           --lastname Admin \
           --role Admin \
-          --email admin@maritime.local
+          --email admin@maritime.local || true
 
     networks:
       - maritime-network
 
 
+  # =========================================================
+  # AIRFLOW WEBSERVER
+  # =========================================================
   airflow-webserver:
     image: apache/airflow:2.10.5
     container_name: maritime-airflow-webserver
@@ -225,6 +280,12 @@ services:
       - ./airflow/logs:/opt/airflow/logs
       - ./airflow/plugins:/opt/airflow/plugins
 
+      # Spark scripts
+      - ./spark:/opt/spark-apps
+
+      # Docker access
+      - /var/run/docker.sock:/var/run/docker.sock
+
     ports:
       - "8082:8080"
 
@@ -234,6 +295,9 @@ services:
       - maritime-network
 
 
+  # =========================================================
+  # AIRFLOW SCHEDULER
+  # =========================================================
   airflow-scheduler:
     image: apache/airflow:2.10.5
     container_name: maritime-airflow-scheduler
@@ -253,19 +317,39 @@ services:
       - ./airflow/logs:/opt/airflow/logs
       - ./airflow/plugins:/opt/airflow/plugins
 
+      # Spark scripts
+      - ./spark:/opt/spark-apps
+
+      # Docker access
+      - /var/run/docker.sock:/var/run/docker.sock
+
     command: scheduler
 
     networks:
       - maritime-network
 
+
+# =========================================================
+# VOLUMES
+# =========================================================
 volumes:
+
   namenode_data:
+
   datanode_data:
+
   postgres_data:
+
   kafka-data:
+
   maritime-ais-download:
     external: true
 
+
+# =========================================================
+# NETWORK
+# =========================================================
 networks:
+
   maritime-network:
     driver: bridge
