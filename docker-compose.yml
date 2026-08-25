@@ -17,7 +17,7 @@ services:
       - maritime-ais-download:/data
 
     environment:
-      - CLUSTER_NAME=maritime
+      CLUSTER_NAME: maritime
 
     env_file:
       - ./.env
@@ -44,7 +44,7 @@ services:
       - datanode_data:/hadoop/dfs/data
 
     environment:
-      - SERVICE_PRECONDITION=namenode:9870
+      SERVICE_PRECONDITION: namenode:9870
 
     env_file:
       - ./.env
@@ -69,7 +69,7 @@ services:
       --webui-port 8080
 
     environment:
-      - AISSTREAM_API_KEY=${AISSTREAM_API_KEY}
+      AISSTREAM_API_KEY: ${AISSTREAM_API_KEY}
 
     ports:
       - "7077:7077"
@@ -183,8 +183,8 @@ services:
       - kafka
 
     environment:
-      - AISSTREAM_API_KEY=${AISSTREAM_API_KEY}
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      AISSTREAM_API_KEY: ${AISSTREAM_API_KEY}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
 
     networks:
       - maritime-network
@@ -228,17 +228,18 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__CORE__EXECUTOR: SequentialExecutor
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
 
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./airflow/logs:/opt/airflow/logs
       - ./airflow/plugins:/opt/airflow/plugins
 
-      # Spark jobs available to Airflow
       - ./spark:/opt/spark-apps
 
-      # Allow Airflow to communicate with Docker
       - /var/run/docker.sock:/var/run/docker.sock
+
+      - maritime-ais-download:/data
 
     command:
       - bash
@@ -262,7 +263,10 @@ services:
   # AIRFLOW WEBSERVER
   # =========================================================
   airflow-webserver:
-    image: apache/airflow:2.10.5
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+
     container_name: maritime-airflow-webserver
     restart: "no"
 
@@ -274,17 +278,18 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__CORE__EXECUTOR: SequentialExecutor
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
 
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./airflow/logs:/opt/airflow/logs
       - ./airflow/plugins:/opt/airflow/plugins
 
-      # Spark scripts
       - ./spark:/opt/spark-apps
 
-      # Docker access
       - /var/run/docker.sock:/var/run/docker.sock
+
+      - maritime-ais-download:/data
 
     ports:
       - "8082:8080"
@@ -299,7 +304,10 @@ services:
   # AIRFLOW SCHEDULER
   # =========================================================
   airflow-scheduler:
-    image: apache/airflow:2.10.5
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+
     container_name: maritime-airflow-scheduler
     restart: "no"
 
@@ -311,19 +319,98 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__CORE__EXECUTOR: SequentialExecutor
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
 
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./airflow/logs:/opt/airflow/logs
       - ./airflow/plugins:/opt/airflow/plugins
 
-      # Spark scripts
       - ./spark:/opt/spark-apps
 
-      # Docker access
       - /var/run/docker.sock:/var/run/docker.sock
 
+      - maritime-ais-download:/data
+
     command: scheduler
+
+    networks:
+      - maritime-network
+
+
+  # =========================================================
+  # DASHBOARD
+  # =========================================================
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+
+    container_name: maritime-dashboard
+    restart: unless-stopped
+
+    depends_on:
+      - kafka
+      - postgres
+
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+
+    ports:
+      - "8501:8501"
+
+    volumes:
+      - ./dashboard:/app
+
+    networks:
+      - maritime-network
+
+
+  # =========================================================
+  # PROMETHEUS
+  # =========================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: maritime-prometheus
+    restart: unless-stopped
+
+    ports:
+      - "9090:9090"
+
+    volumes:
+      - prometheus_data:/prometheus
+      - ./dashboard/prometheus.yml:/etc/prometheus/prometheus.yml
+
+    networks:
+      - maritime-network
+
+
+  # =========================================================
+  # GRAFANA
+  # =========================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: maritime-grafana
+    restart: unless-stopped
+
+    depends_on:
+      - prometheus
+
+    ports:
+      - "3000:3000"
+
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+
+    volumes:
+      - grafana_data:/var/lib/grafana
 
     networks:
       - maritime-network
@@ -342,6 +429,11 @@ volumes:
 
   kafka-data:
 
+  prometheus_data:
+
+  grafana_data:
+
+  # Shared volume between Airflow and NameNode
   maritime-ais-download:
     external: true
 

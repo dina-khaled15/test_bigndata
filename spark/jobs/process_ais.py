@@ -12,6 +12,8 @@ from pyspark.sql.functions import (
     count,
     min,
     max,
+    abs as spark_abs,
+    round as spark_round,
 )
 
 
@@ -19,11 +21,25 @@ from pyspark.sql.functions import (
 # CONFIGURATION
 # ============================================================
 
-INPUT_PATH = "hdfs://namenode:9000/maritime/raw/2025/ais-2025-01-01.csv"
+INPUT_PATHS = [
+    "hdfs://namenode:9000/maritime/raw/2024/ais-2024-01-01.csv",
+    "hdfs://namenode:9000/maritime/raw/2024/ais-2024-01-02.csv",
 
-AIS_OUTPUT_PATH = "hdfs://namenode:9000/maritime/processed/ais"
+    "hdfs://namenode:9000/maritime/raw/2025/ais-2025-01-01.csv",
+    "hdfs://namenode:9000/maritime/raw/2025/ais-2025-01-02.csv",
+]
 
-BASELINE_OUTPUT_PATH = "hdfs://namenode:9000/maritime/processed/baseline"
+AIS_OUTPUT_PATH = (
+    "hdfs://namenode:9000/maritime/processed/ais"
+)
+
+BASELINE_OUTPUT_PATH = (
+    "hdfs://namenode:9000/maritime/processed/baseline"
+)
+
+BATCH_ANOMALY_OUTPUT_PATH = (
+    "hdfs://namenode:9000/maritime/processed/anomalies"
+)
 
 
 # ============================================================
@@ -33,18 +49,11 @@ BASELINE_OUTPUT_PATH = "hdfs://namenode:9000/maritime/processed/baseline"
 spark = (
     SparkSession.builder
     .appName("Maritime AIS Historical Processing")
-
-    # Shuffle configuration
     .config("spark.sql.shuffle.partitions", "200")
-
-    # Adaptive Query Execution
     .config("spark.sql.adaptive.enabled", "true")
     .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
     .config("spark.sql.adaptive.skewJoin.enabled", "true")
-
-    # Reduce memory pressure during aggregation/shuffle
     .config("spark.sql.files.maxPartitionBytes", "128m")
-
     .getOrCreate()
 )
 
@@ -59,26 +68,19 @@ print("=" * 70)
 print("MARITIME AIS HISTORICAL PROCESSING")
 print("=" * 70)
 
-print(f"Input    : {INPUT_PATH}")
-print(f"AIS      : {AIS_OUTPUT_PATH}")
-print(f"Baseline : {BASELINE_OUTPUT_PATH}")
-
 
 # ============================================================
-# 1. READ HISTORICAL AIS DATA
+# 1. READ HISTORICAL DATA
 # ============================================================
 
-print("\n[1/8] Reading AIS historical data from HDFS...")
+print("\n[1/10] Reading AIS historical data...")
 
 df = (
     spark.read
     .option("header", "true")
     .option("inferSchema", "true")
-    .csv(INPUT_PATH)
+    .csv(INPUT_PATHS)
 )
-
-print("Raw schema:")
-df.printSchema()
 
 input_count = df.count()
 
@@ -86,10 +88,10 @@ print(f"Input records: {input_count:,}")
 
 
 # ============================================================
-# 2. STANDARDIZE COLUMNS
+# 2. STANDARDIZE
 # ============================================================
 
-print("\n[2/8] Standardizing columns...")
+print("\n[2/10] Standardizing columns...")
 
 df = (
     df
@@ -133,52 +135,37 @@ df = (
 
 
 # ============================================================
-# 3. CLEAN AIS RECORDS
+# 3. CLEAN
 # ============================================================
 
-print("\n[3/8] Cleaning AIS records...")
+print("\n[3/10] Cleaning AIS records...")
 
 clean_df = (
     df
-
-    # --------------------------------------------------------
-    # Required fields
-    # --------------------------------------------------------
-
     .filter(col("mmsi").isNotNull())
     .filter(col("timestamp").isNotNull())
     .filter(col("latitude").isNotNull())
     .filter(col("longitude").isNotNull())
 
-    # --------------------------------------------------------
-    # Geographic validation
-    # --------------------------------------------------------
-
     .filter(
         (col("latitude") >= -90)
         & (col("latitude") <= 90)
     )
+
     .filter(
         (col("longitude") >= -180)
         & (col("longitude") <= 180)
     )
-
-    # --------------------------------------------------------
-    # Speed validation
-    # --------------------------------------------------------
 
     .filter(
         col("sog").isNull()
         |
         (
             (col("sog") >= 0)
-            & (col("sog") <= 100)
+            &
+            (col("sog") <= 100)
         )
     )
-
-    # --------------------------------------------------------
-    # Course validation / normalization
-    # --------------------------------------------------------
 
     .withColumn(
         "cog",
@@ -188,10 +175,6 @@ clean_df = (
         )
     )
 
-    # --------------------------------------------------------
-    # Heading validation / normalization
-    # --------------------------------------------------------
-
     .withColumn(
         "heading",
         when(
@@ -200,27 +183,15 @@ clean_df = (
         )
     )
 
-    # --------------------------------------------------------
-    # Vessel name cleanup
-    # --------------------------------------------------------
-
     .withColumn(
         "vessel_name",
         trim(col("vessel_name"))
     )
 
-    # --------------------------------------------------------
-    # IMO cleanup
-    # --------------------------------------------------------
-
     .withColumn(
         "imo",
         trim(col("imo"))
     )
-
-    # --------------------------------------------------------
-    # Call sign cleanup
-    # --------------------------------------------------------
 
     .withColumn(
         "call_sign",
@@ -230,21 +201,15 @@ clean_df = (
 
 
 # ============================================================
-# 4. CREATE TIME FEATURES
+# 4. TIME FEATURES
 # ============================================================
 
-print("\n[4/8] Creating time features...")
+print("\n[4/10] Creating time features...")
 
 clean_df = (
     clean_df
-    .withColumn(
-        "hour",
-        hour(col("timestamp"))
-    )
-    .withColumn(
-        "day_of_week",
-        dayofweek(col("timestamp"))
-    )
+    .withColumn("hour", hour(col("timestamp")))
+    .withColumn("day_of_week", dayofweek(col("timestamp")))
 )
 
 
@@ -252,22 +217,12 @@ clean_df = (
 # 5. REMOVE DUPLICATES
 # ============================================================
 
-print("\n[5/8] Removing duplicate AIS records...")
-
-print("Repartitioning by MMSI before duplicate removal...")
-
-# IMPORTANT:
-# Distribute records by MMSI before the large shuffle.
-#
-# 200 partitions is appropriate for the current dataset size.
-# AQE can coalesce them later if necessary.
+print("\n[5/10] Removing duplicates...")
 
 clean_df = clean_df.repartition(
     200,
     col("mmsi")
 )
-
-print("Removing duplicates...")
 
 clean_df = clean_df.dropDuplicates(
     [
@@ -278,18 +233,17 @@ clean_df = clean_df.dropDuplicates(
     ]
 )
 
-# Materialize the result once
 clean_count = clean_df.count()
 
-print(f"Clean records   : {clean_count:,}")
-print(f"Removed records : {input_count - clean_count:,}")
+print(f"Clean records: {clean_count:,}")
+print(f"Removed: {input_count - clean_count:,}")
 
 
 # ============================================================
-# 6. WRITE CLEAN AIS DATA AS PARQUET
+# 6. WRITE CLEAN HISTORICAL DATA
 # ============================================================
 
-print("\n[6/8] Writing cleaned AIS data as Parquet...")
+print("\n[6/10] Writing historical Parquet...")
 
 (
     clean_df
@@ -299,16 +253,12 @@ print("\n[6/8] Writing cleaned AIS data as Parquet...")
     .parquet(AIS_OUTPUT_PATH)
 )
 
-print(
-    f"AIS Parquet written to: {AIS_OUTPUT_PATH}"
-)
-
 
 # ============================================================
-# 7. BUILD HISTORICAL VESSEL BEHAVIOR BASELINE
+# 7. BUILD BASELINE
 # ============================================================
 
-print("\n[7/8] Building historical vessel behavioral baseline...")
+print("\n[7/10] Building vessel behavioral baseline...")
 
 baseline_df = (
     clean_df
@@ -336,11 +286,6 @@ baseline_df = (
     )
 )
 
-
-# ============================================================
-# HANDLE NULL STANDARD DEVIATIONS
-# ============================================================
-
 baseline_df = (
     baseline_df
 
@@ -361,16 +306,18 @@ baseline_df = (
     )
 )
 
+baseline_df.cache()
 
-print("Baseline schema:")
-baseline_df.printSchema()
+baseline_count = baseline_df.count()
+
+print(f"Baseline vessels: {baseline_count:,}")
 
 
 # ============================================================
 # 8. WRITE BASELINE
 # ============================================================
 
-print("\n[8/8] Writing vessel behavioral baseline...")
+print("\n[8/10] Writing behavioral baseline...")
 
 (
     baseline_df
@@ -379,30 +326,163 @@ print("\n[8/8] Writing vessel behavioral baseline...")
     .parquet(BASELINE_OUTPUT_PATH)
 )
 
-print(
-    f"Baseline written to: {BASELINE_OUTPUT_PATH}"
+
+# ============================================================
+# 9. BATCH ANOMALY DETECTION
+# ============================================================
+
+print("\n[9/10] Detecting historical anomalies...")
+
+batch_df = (
+    clean_df
+    .join(
+        baseline_df,
+        on="mmsi",
+        how="left"
+    )
+)
+
+# ------------------------------------------------------------
+# Speed anomaly
+#
+# Normal:
+# average +/- 3 standard deviations
+#
+# If stddev = 0, fallback to min/max.
+# ------------------------------------------------------------
+
+batch_df = (
+    batch_df
+
+    .withColumn(
+        "speed_lower_bound",
+        when(
+            col("speed_stddev") > 0,
+            col("avg_speed") - (3 * col("speed_stddev"))
+        ).otherwise(col("min_speed"))
+    )
+
+    .withColumn(
+        "speed_upper_bound",
+        when(
+            col("speed_stddev") > 0,
+            col("avg_speed") + (3 * col("speed_stddev"))
+        ).otherwise(col("max_speed"))
+    )
+
+    .withColumn(
+        "speed_anomaly",
+        when(
+            col("sog").isNull(),
+            False
+        ).otherwise(
+            (col("sog") < col("speed_lower_bound"))
+            |
+            (col("sog") > col("speed_upper_bound"))
+        )
+    )
+
+    .withColumn(
+        "course_lower_bound",
+        col("avg_course") - (3 * col("course_stddev"))
+    )
+
+    .withColumn(
+        "course_upper_bound",
+        col("avg_course") + (3 * col("course_stddev"))
+    )
+
+    .withColumn(
+        "course_anomaly",
+        when(
+            col("cog").isNull(),
+            False
+        ).otherwise(
+            (col("cog") < col("course_lower_bound"))
+            |
+            (col("cog") > col("course_upper_bound"))
+        )
+    )
+
+    .withColumn(
+        "anomaly",
+        col("speed_anomaly") | col("course_anomaly")
+    )
+
+    .withColumn(
+        "anomaly_type",
+        when(
+            col("speed_anomaly") & col("course_anomaly"),
+            lit("SPEED_AND_COURSE")
+        )
+        .when(
+            col("speed_anomaly"),
+            lit("SPEED")
+        )
+        .when(
+            col("course_anomaly"),
+            lit("COURSE")
+        )
+        .otherwise(
+            lit("NORMAL")
+        )
+    )
+)
+
+batch_anomalies = (
+    batch_df
+    .filter(col("anomaly") == True)
+    .select(
+        "mmsi",
+        "timestamp",
+        "latitude",
+        "longitude",
+        "sog",
+        "cog",
+        "avg_speed",
+        "speed_stddev",
+        "anomaly_type"
+    )
+)
+
+anomaly_count = batch_anomalies.count()
+
+print(f"Batch anomalies: {anomaly_count:,}")
+
+
+# ============================================================
+# 10. WRITE BATCH ANOMALIES
+# ============================================================
+
+print("\n[10/10] Writing batch anomalies...")
+
+(
+    batch_anomalies
+    .write
+    .mode("overwrite")
+    .parquet(BATCH_ANOMALY_OUTPUT_PATH)
 )
 
 
 # ============================================================
-# FINAL SUMMARY
+# FINAL
 # ============================================================
 
 print("\n" + "=" * 70)
-print("MARITIME AIS PROCESSING COMPLETED SUCCESSFULLY")
+print("MARITIME BATCH PROCESSING COMPLETED")
 print("=" * 70)
 
 print(f"Input records       : {input_count:,}")
 print(f"Clean records       : {clean_count:,}")
-print(f"Removed records     : {input_count - clean_count:,}")
-print(f"AIS Parquet         : {AIS_OUTPUT_PATH}")
-print(f"Behavioral Baseline : {BASELINE_OUTPUT_PATH}")
+print(f"Historical vessels  : {baseline_count:,}")
+print(f"Batch anomalies     : {anomaly_count:,}")
+
+print(f"AIS output          : {AIS_OUTPUT_PATH}")
+print(f"Baseline output     : {BASELINE_OUTPUT_PATH}")
+print(f"Anomaly output      : {BATCH_ANOMALY_OUTPUT_PATH}")
 
 print("=" * 70)
 
-
-# ============================================================
-# STOP SPARK
-# ============================================================
+baseline_df.unpersist()
 
 spark.stop()

@@ -1,6 +1,6 @@
 from datetime import datetime
 from pathlib import Path
-
+import subprocess
 import requests
 
 from airflow import DAG
@@ -10,93 +10,174 @@ from airflow.operators.python import PythonOperator
 DOWNLOAD_DIR = Path("/tmp/maritime_noaa")
 HDFS_BASE = "/maritime/raw"
 
+FILES = {
+    2024: [
+        "ais-2024-01-01.csv.zst",
+        "ais-2024-01-02.csv.zst",
+        "ais-2024-01-03.csv.zst",
+        "ais-2024-01-04.csv.zst",
+        "ais-2024-01-05.csv.zst",
+    ],
+    2025: [
+        "ais-2025-01-01.csv.zst",
+        "ais-2025-01-02.csv.zst",
+        "ais-2025-01-03.csv.zst",
+        "ais-2025-01-04.csv.zst",
+        "ais-2025-01-05.csv.zst",
+    ],
+}
 
-def get_file_config(context):
-    dag_run = context["dag_run"]
-    conf = dag_run.conf or {}
 
-    year = int(conf.get("year", 2024))
-    date = conf.get("date", f"{year}-01-01")
-
-    filename = f"ais-{date}.csv.zst"
-
-    return year, date, filename
-
-
-def download_noaa_file(**context):
-    year, date, filename = get_file_config(context)
-
-    noaa_url = (
-        f"https://noaaocm.blob.core.windows.net/"
-        f"ais/csv2/csv{year}/{filename}"
-    )
-
+def download_and_extract():
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-    output_file = DOWNLOAD_DIR / filename
+    for year, filenames in FILES.items():
 
-    response = requests.get(
-        noaa_url,
-        stream=True,
-        timeout=120,
-    )
-    response.raise_for_status()
+        for filename in filenames:
 
-    with output_file.open("wb") as file:
-        for chunk in response.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                file.write(chunk)
+            url = (
+                f"https://noaaocm.blob.core.windows.net/"
+                f"ais/csv2/csv{year}/{filename}"
+            )
 
-    print(f"Downloaded NOAA file to: {output_file}")
-    print(f"Source URL: {noaa_url}")
-    print(f"File size: {output_file.stat().st_size} bytes")
+            compressed_file = DOWNLOAD_DIR / filename
+
+            print("=" * 70)
+            print(f"Downloading: {filename}")
+            print(f"URL: {url}")
+
+            response = requests.get(
+                url,
+                stream=True,
+                timeout=300
+            )
+
+            response.raise_for_status()
+
+            with compressed_file.open("wb") as f:
+                for chunk in response.iter_content(
+                    chunk_size=1024 * 1024
+                ):
+                    if chunk:
+                        f.write(chunk)
+
+            print(
+                f"Downloaded: "
+                f"{compressed_file.stat().st_size / (1024**2):.2f} MB"
+            )
+
+            # ------------------------------------------------
+            # Extract .zst -> .csv
+            # ------------------------------------------------
+
+            csv_file = compressed_file.with_suffix("")
+
+            print(f"Extracting: {filename}")
+
+            subprocess.run(
+                [
+                    "zstd",
+                    "-d",
+                    "-f",
+                    str(compressed_file),
+                    "-o",
+                    str(csv_file),
+                ],
+                check=True,
+            )
+
+            print(f"Extracted: {csv_file}")
+
+            # Remove compressed file to save space
+            compressed_file.unlink()
+
+            print(f"Removed compressed file: {compressed_file}")
 
 
-def upload_to_hdfs(**context):
-    year, date, filename = get_file_config(context)
+def upload_to_hdfs():
 
-    local_file = DOWNLOAD_DIR / filename
-    hdfs_directory = f"{HDFS_BASE}/{year}"
-    hdfs_file = f"{hdfs_directory}/{filename}"
+    for year, filenames in FILES.items():
 
-    if not local_file.exists():
-        raise FileNotFoundError(
-            f"Downloaded file not found: {local_file}"
+        hdfs_directory = f"{HDFS_BASE}/{year}"
+
+        # Create HDFS directory
+        subprocess.run(
+            [
+                "curl",
+                "-s",
+                "-X",
+                "PUT",
+                "-L",
+                f"http://namenode:9870/webhdfs/v1"
+                f"{hdfs_directory}"
+                f"?op=MKDIRS",
+            ],
+            check=True,
         )
 
-    import subprocess
+        print(f"HDFS directory ready: {hdfs_directory}")
 
-    subprocess.run(
-        [
-            "curl",
-            "-s",
-            "-X",
-            "PUT",
-            "-L",
-            "-H",
-            "Content-Type: application/octet-stream",
-            f"http://namenode:9870/webhdfs/v1{hdfs_file}"
-            f"?op=CREATE&overwrite=true",
-            "--data-binary",
-            f"@{local_file}",
-        ],
-        check=True,
-    )
+        for filename in filenames:
 
-    print(f"Uploaded to HDFS: {hdfs_file}")
+            csv_filename = filename.replace(".zst", "")
+
+            local_file = DOWNLOAD_DIR / csv_filename
+
+            hdfs_file = (
+                f"{hdfs_directory}/{csv_filename}"
+            )
+
+            if not local_file.exists():
+                raise FileNotFoundError(
+                    f"File not found: {local_file}"
+                )
+
+            print("=" * 70)
+            print(f"Uploading to HDFS:")
+            print(f"Local : {local_file}")
+            print(f"HDFS  : {hdfs_file}")
+
+            subprocess.run(
+                [
+                    "curl",
+                    "-s",
+                    "-X",
+                    "PUT",
+                    "-L",
+                    "-H",
+                    "Content-Type: application/octet-stream",
+                    f"http://namenode:9870/webhdfs/v1"
+                    f"{hdfs_file}"
+                    f"?op=CREATE&overwrite=true",
+                    "--data-binary",
+                    f"@{local_file}",
+                ],
+                check=True,
+            )
+
+            print(f"Uploaded successfully: {hdfs_file}")
 
 
 with DAG(
     dag_id="noaa_historical_ingestion",
+
     start_date=datetime(2026, 1, 1),
+
     schedule=None,
+
     catchup=False,
-    tags=["maritime", "member1", "noaa"],
+
+    tags=[
+        "maritime",
+        "noaa",
+        "historical",
+        "ingestion",
+    ],
 ) as dag:
 
-    download = PythonOperator(
-        task_id="download_noaa_file",
-        python_callable=download_noaa_file,
+    download_extract = PythonOperator(
+        task_id="download_and_extract_noaa",
+        python_callable=download_and_extract,
     )
 
     upload = PythonOperator(
@@ -104,4 +185,4 @@ with DAG(
         python_callable=upload_to_hdfs,
     )
 
-    download >> upload
+    download_extract >> upload

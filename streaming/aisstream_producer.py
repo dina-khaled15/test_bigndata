@@ -1,329 +1,457 @@
-# import asyncio
-# import json
-# import os
-# from datetime import datetime, timezone
-
-# import websockets
-# from kafka import KafkaProducer
-
-
-# AISSTREAM_URL = "wss://stream.aisstream.io/v0/stream"
-
-# KAFKA_BOOTSTRAP_SERVERS = os.getenv(
-#     "KAFKA_BOOTSTRAP_SERVERS",
-#     "kafka:9092",
-# )
-
-# KAFKA_TOPIC = "ais-events"
-
-# API_KEY = os.getenv("AISSTREAM_API_KEY")
-
-
-# if not API_KEY:
-#     raise RuntimeError("AISSTREAM_API_KEY is not set")
-
-
-# producer = KafkaProducer(
-#     bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-#     value_serializer=lambda value: json.dumps(value).encode("utf-8"),
-# )
-
-
-# async def stream_ais():
-
-#     async with websockets.connect(AISSTREAM_URL) as websocket:
-
-#         subscription = {
-#             "APIKey": API_KEY,
-#             "BoundingBoxes": [
-#                 [
-#                     [-10.0, -30.0],
-#                     [60.0, 60.0],
-#                 ]
-#             ],
-#             "FilterMessageTypes": [
-#                 "PositionReport",
-#             ],
-#         }
-
-#         await websocket.send(json.dumps(subscription))
-
-#         print("Connected to AISStream")
-#         print("Subscription sent")
-#         print("Streaming AIS PositionReports to Kafka...")
-
-#         async for message in websocket:
-
-#             print("RAW AISSTREAM MESSAGE:")
-#             print(message)
-
-#             data = json.loads(message)
-
-#             if "error" in data:
-#                 print(f"AISStream ERROR: {data['error']}")
-#                 continue
-
-#             if data.get("MessageType") != "PositionReport":
-#                 print(f"Skipping message type: {data.get('MessageType')}")
-#                 continue
-
-#             position = data["Message"]["PositionReport"]
-
-#             event = {
-#                 "mmsi": position.get("UserID"),
-#                 "base_date_time": datetime.now(timezone.utc).strftime(
-#                     "%Y-%m-%d %H:%M:%S"
-#                 ),
-#                 "longitude": position.get("Longitude"),
-#                 "latitude": position.get("Latitude"),
-#                 "sog": position.get("Sog"),
-#                 "cog": position.get("Cog"),
-#             }
-
-#             producer.send(
-#                 KAFKA_TOPIC,
-#                 value=event,
-#             )
-
-#             producer.flush()
-
-#             print(
-#                 f"Sent AIS event: "
-#                 f"MMSI={event['mmsi']} "
-#                 f"lat={event['latitude']} "
-#                 f"lon={event['longitude']}"
-#             )
-
-
-# if __name__ == "__main__":
-#     asyncio.run(stream_ais())
-
-
 import json
-import time
 import os
+import time
 
-import requests
 import pandas as pd
+import requests
 from kafka import KafkaProducer
 
 
-# ==============================
-# Kafka Configuration
-# ==============================
+# ============================================================
+# Configuration
+# ============================================================
 
 KAFKA_BOOTSTRAP_SERVERS = "kafka:9092"
 KAFKA_TOPIC = "ais-events"
 
+HDFS_FILES = [
+    "/maritime/raw/2024/ais-2024-01-01.csv",
+    "/maritime/raw/2025/ais-2025-01-01.csv",
+]
 
-# ==============================
-# HDFS Configuration
-# ==============================
+LOCAL_DIR = "/tmp/ais_data"
 
-HDFS_FILE = "/maritime/raw/2024/ais-2024-01-01.csv.zst"
+# Number of records sent per second
+ROWS_PER_SECOND = 200
 
-LOCAL_FILE = "/tmp/ais-2024-01-01.csv.zst"
+# Number of rows read from each CSV
+ROWS_PER_FILE = 10000
+
+# Print progress every N records
+PRINT_EVERY = 200
 
 
-# ==============================
+# ============================================================
 # Kafka Producer
-# ==============================
+# ============================================================
 
 producer = KafkaProducer(
     bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-    value_serializer=lambda x: json.dumps(x).encode("utf-8")
+    value_serializer=lambda value: json.dumps(
+        value,
+        allow_nan=False
+    ).encode("utf-8"),
+    linger_ms=5,
+    batch_size=65536,
+    acks="all",
+    retries=5,
 )
 
 
-# ==============================
-# Download file from HDFS
-# ==============================
+# ============================================================
+# HDFS Download
+# ============================================================
 
-def download_from_hdfs():
+def download_from_hdfs(hdfs_file):
 
-    print("==============================")
-    print("Downloading AIS data from HDFS...")
-    print("==============================")
+    os.makedirs(LOCAL_DIR, exist_ok=True)
+
+    filename = os.path.basename(hdfs_file)
+    local_file = os.path.join(LOCAL_DIR, filename)
+
+    print()
+    print("=" * 70)
+    print("DOWNLOADING FROM HDFS")
+    print("=" * 70)
+    print(f"HDFS : {hdfs_file}")
+    print(f"LOCAL: {local_file}")
+    print("=" * 70)
 
     url = (
         "http://namenode:9870/webhdfs/v1"
-        f"{HDFS_FILE}?op=OPEN"
+        f"{hdfs_file}?op=OPEN"
     )
 
-    with requests.get(
-        url,
-        allow_redirects=True,
-        stream=True,
-        timeout=300
-    ) as response:
+    try:
 
-        response.raise_for_status()
+        with requests.get(
+            url,
+            allow_redirects=True,
+            stream=True,
+            timeout=300,
+        ) as response:
 
-        with open(LOCAL_FILE, "wb") as file:
+            response.raise_for_status()
 
-            for chunk in response.iter_content(
-                chunk_size=1024 * 1024
-            ):
-                if chunk:
-                    file.write(chunk)
+            with open(local_file, "wb") as file:
 
-    print("Download completed successfully")
+                for chunk in response.iter_content(
+                    chunk_size=1024 * 1024
+                ):
+
+                    if chunk:
+                        file.write(chunk)
+
+    except Exception as error:
+
+        print()
+        print("HDFS DOWNLOAD ERROR")
+        print(error)
+        raise
+
+    file_size_mb = os.path.getsize(local_file) / (
+        1024 * 1024
+    )
 
     print(
-        f"Local file size: "
-        f"{os.path.getsize(LOCAL_FILE) / (1024 * 1024):.2f} MB"
+        f"Downloaded successfully: "
+        f"{file_size_mb:.2f} MB"
     )
 
+    return local_file
 
-# ==============================
-# Clean values
-# ==============================
+
+# ============================================================
+# Clean Values
+# ============================================================
 
 def clean_value(value):
 
-    if pd.isna(value):
+    if value is None:
         return None
 
+    try:
+
+        if pd.isna(value):
+            return None
+
+    except (TypeError, ValueError):
+
+        pass
+
+    # Convert NumPy scalar types to native Python types
     if hasattr(value, "item"):
-        return value.item()
+
+        try:
+            value = value.item()
+
+        except Exception:
+            pass
+
+    # Convert timestamps to string
+    if hasattr(value, "isoformat"):
+
+        try:
+            return value.isoformat()
+
+        except Exception:
+            pass
 
     return value
 
 
-# ==============================
-# Stream CSV to Kafka
-# ==============================
+# ============================================================
+# Convert CSV Row to Kafka Event
+# ============================================================
 
-def stream_csv():
+def row_to_event(row):
 
-    download_from_hdfs()
+    return {
+        "mmsi": clean_value(
+            row.get("mmsi")
+        ),
 
-    print("==============================")
-    print("Reading AIS CSV...")
-    print("==============================")
+        "base_date_time": clean_value(
+            row.get("base_date_time")
+        ),
 
-    df = pd.read_csv(
-        LOCAL_FILE,
-        compression="zstd",
-        nrows=10000
-    )
+        "longitude": clean_value(
+            row.get("longitude")
+        ),
+
+        "latitude": clean_value(
+            row.get("latitude")
+        ),
+
+        "sog": clean_value(
+            row.get("sog")
+        ),
+
+        "cog": clean_value(
+            row.get("cog")
+        ),
+    }
+
+
+# ============================================================
+# Validate Event
+# ============================================================
+
+def is_valid_event(event):
+
+    if event["mmsi"] is None:
+        return False
+
+    if event["latitude"] is None:
+        return False
+
+    if event["longitude"] is None:
+        return False
+
+    return True
+
+
+# ============================================================
+# Stream One CSV File
+# ============================================================
+
+def stream_file(hdfs_file):
+
+    local_file = download_from_hdfs(hdfs_file)
+
+    print()
+    print("=" * 70)
+    print("READING CSV")
+    print("=" * 70)
+    print(f"File: {local_file}")
+    print("=" * 70)
+
+    try:
+
+        df = pd.read_csv(
+            local_file,
+            nrows=ROWS_PER_FILE,
+        )
+
+    except Exception as error:
+
+        print()
+        print("CSV READ ERROR")
+        print(error)
+        raise
 
     print(f"Rows loaded: {len(df)}")
-
-    print("==============================")
-    print("Columns in CSV:")
+    print()
+    print("Columns:")
     print(df.columns.tolist())
-    print("==============================")
 
-    print("First 5 rows:")
-    print(df.head())
+    required_columns = {
+        "mmsi",
+        "base_date_time",
+        "longitude",
+        "latitude",
+        "sog",
+        "cog",
+    }
 
-    print("==============================")
-    print("Starting Kafka streaming...")
-    print("==============================")
+    missing_columns = required_columns - set(
+        df.columns
+    )
 
+    if missing_columns:
+
+        raise RuntimeError(
+            f"Missing required columns: "
+            f"{sorted(missing_columns)}"
+        )
+
+    print()
+    print("=" * 70)
+    print("STARTING KAFKA STREAM")
+    print("=" * 70)
+    print(f"Topic          : {KAFKA_TOPIC}")
+    print(f"Target rate    : {ROWS_PER_SECOND} rows/sec")
+    print(f"Maximum rows   : {ROWS_PER_FILE}")
+    print("=" * 70)
+
+    sent = 0
+    skipped = 0
+
+    start_time = time.time()
 
     for index, row in df.iterrows():
 
-        # IMPORTANT:
-        # The actual columns in our dataset are lowercase.
+        event = row_to_event(row)
 
-        event = {
+        # ----------------------------------------------------
+        # Validate
+        # ----------------------------------------------------
 
-            "mmsi": clean_value(
-                row.get("mmsi")
-            ),
+        if not is_valid_event(event):
 
-            "base_date_time": clean_value(
-                row.get("base_date_time")
-            ),
-
-            "longitude": clean_value(
-                row.get("longitude")
-            ),
-
-            "latitude": clean_value(
-                row.get("latitude")
-            ),
-
-            "sog": clean_value(
-                row.get("sog")
-            ),
-
-            "cog": clean_value(
-                row.get("cog")
-            )
-        }
-
-
-        # Skip rows without basic position information
-
-        if (
-            event["mmsi"] is None
-            and event["latitude"] is None
-            and event["longitude"] is None
-        ):
+            skipped += 1
 
             print(
-                f"Skipping invalid row {index}"
+                f"Skipping invalid row: {index}"
             )
 
             continue
 
+        # ----------------------------------------------------
+        # Send to Kafka
+        # ----------------------------------------------------
 
-        # Send event to Kafka
+        try:
 
-        future = producer.send(
-            KAFKA_TOPIC,
-            value=event
+            future = producer.send(
+                KAFKA_TOPIC,
+                value=event,
+            )
+
+            # Wait for Kafka confirmation
+            # every PRINT_EVERY messages
+            # instead of blocking every message.
+
+            if sent % PRINT_EVERY == 0:
+
+                future.get(timeout=10)
+
+        except Exception as error:
+
+            print()
+            print("=" * 70)
+            print("KAFKA SEND ERROR")
+            print("=" * 70)
+            print(f"Row: {index}")
+            print(error)
+            print("=" * 70)
+
+            raise
+
+        sent += 1
+
+        # ----------------------------------------------------
+        # Rate limiting
+        # ----------------------------------------------------
+
+        target_time = (
+            start_time
+            + (sent / ROWS_PER_SECOND)
         )
 
-
-        # Wait for Kafka confirmation
-
-        future.get(timeout=10)
-
-
-        print(
-            f"Sent row {index} | "
-            f"MMSI={event['mmsi']} | "
-            f"LAT={event['latitude']} | "
-            f"LON={event['longitude']}"
+        sleep_time = (
+            target_time
+            - time.time()
         )
 
+        if sleep_time > 0:
 
-        # Simulate streaming
+            time.sleep(sleep_time)
 
-        time.sleep(0.2)
+        # ----------------------------------------------------
+        # Progress
+        # ----------------------------------------------------
 
+        if sent % PRINT_EVERY == 0:
+
+            elapsed = (
+                time.time()
+                - start_time
+            )
+
+            rate = (
+                sent / elapsed
+                if elapsed > 0
+                else 0
+            )
+
+            print(
+                f"[PRODUCER] "
+                f"Sent={sent} | "
+                f"Skipped={skipped} | "
+                f"Rate={rate:.1f} rows/sec | "
+                f"MMSI={event['mmsi']} | "
+                f"LAT={event['latitude']} | "
+                f"LON={event['longitude']}"
+            )
+
+    # --------------------------------------------------------
+    # Flush remaining Kafka messages
+    # --------------------------------------------------------
+
+    print()
+    print("Flushing Kafka producer...")
 
     producer.flush()
 
-    print("==============================")
-    print("Finished sending AIS data")
-    print("==============================")
+    elapsed = (
+        time.time()
+        - start_time
+    )
+
+    final_rate = (
+        sent / elapsed
+        if elapsed > 0
+        else 0
+    )
+
+    print()
+    print("=" * 70)
+    print("FILE STREAM COMPLETED")
+    print("=" * 70)
+    print(f"Source file : {hdfs_file}")
+    print(f"Sent        : {sent}")
+    print(f"Skipped     : {skipped}")
+    print(f"Elapsed     : {elapsed:.2f} sec")
+    print(f"Average rate: {final_rate:.1f} rows/sec")
+    print("=" * 70)
 
 
-# ==============================
+# ============================================================
 # Main
-# ==============================
+# ============================================================
 
 if __name__ == "__main__":
 
+    print()
+    print("=" * 70)
+    print("MARITIME AIS KAFKA PRODUCER")
+    print("=" * 70)
+    print(f"Kafka : {KAFKA_BOOTSTRAP_SERVERS}")
+    print(f"Topic : {KAFKA_TOPIC}")
+    print(
+        f"Rate  : {ROWS_PER_SECOND} rows/sec"
+    )
+    print(
+        f"Rows/file: {ROWS_PER_FILE}"
+    )
+    print("=" * 70)
+
     try:
 
-        stream_csv()
+        for hdfs_file in HDFS_FILES:
+
+            stream_file(hdfs_file)
+
+    except KeyboardInterrupt:
+
+        print()
+        print("Producer stopped by user.")
 
     except Exception as error:
 
-        print("==============================")
+        print()
+        print("=" * 70)
         print("PRODUCER ERROR")
-        print("==============================")
-
+        print("=" * 70)
         print(error)
+        print("=" * 70)
 
         raise
 
     finally:
 
-        producer.close()
+        print()
+        print("Closing Kafka producer...")
+
+        try:
+            producer.flush()
+        except Exception:
+            pass
+
+        try:
+            producer.close()
+        except Exception:
+            pass
+
+        print("Producer closed.")
